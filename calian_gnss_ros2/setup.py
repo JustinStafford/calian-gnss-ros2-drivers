@@ -31,7 +31,9 @@ setup(
     packages=find_packages(),
     data_files=package_files(data_files, ["launch/", "params/"]),
     install_requires=[
-        "setuptools<=58.2.0",
+        # NOTE: dropped the "setuptools<=58.2.0" pin — it fails to install on
+        # Jazzy / Ubuntu 24.04 (Python 3.12); use system setuptools.
+        "setuptools",
         "paho-mqtt",
         "pyubx2",
         "pynmeagps",

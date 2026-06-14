@@ -49,6 +49,9 @@ float64 accuracy_3d
 float64 heading
 # length of the GPS receiver acting as rover relative to base in meters.
 float64 length
+# 1-sigma accuracy of the moving-baseline heading in degrees (u-blox accHeading).
+# 0.0 when the heading is not valid.
+float64 heading_accuracy
 # quality string of the antenna.
 string quality
 # True if augmentations were used.(RTCM corrections if moving_baseline_configuration / SPARTN messages if in disabled configuration)

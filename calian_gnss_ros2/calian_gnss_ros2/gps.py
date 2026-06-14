@@ -6,13 +6,13 @@ Operates in three modes:
 - **Rover** - rover antenna receiving RTCM corrections.
 """
 
+import math
 import sys
-import threading
 from typing import Literal
 
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import NavSatFix
+from sensor_msgs.msg import NavSatFix, Imu
 from std_msgs.msg import Header
 from pynmeagps import NMEAMessage
 from pyrtcm import RTCMReader
@@ -39,12 +39,28 @@ class Gps(Node):
 
         # ---- Parameters -------------------------------------------------
         self.declare_parameter("unique_id", "")
+        # Explicit serial device path (e.g. /dev/gnss_front). When set, the
+        # driver binds to this port directly and skips the UBX unique_id scan
+        # (which only probes ports whose description contains "Standard" and so
+        # never matches a generic FTDI bridge). unique_id, if also set, is then
+        # used only as a non-fatal post-connect sanity check.
+        self.declare_parameter("device", "")
         self.declare_parameter("baud_rate", 230400)
         self.declare_parameter("use_corrections", True)
         self.declare_parameter("frame_id", "gps")
+        # Rover only: heading→yaw publishing.  heading_offset_deg accounts for
+        # the antenna mount (base→rover vector vs vehicle-forward; with
+        # base=front/rover=rear the vector points aft, so 180).  The yaw
+        # variance tracks the receiver's accHeading (tight when Fixed, loose at
+        # Float); heading_stddev_deg is the FLOOR — we never claim better.
+        self.declare_parameter("heading_offset_deg", 180.0)
+        self.declare_parameter("heading_stddev_deg", 1.0)
 
         self.unique_id: str = (
             self.get_parameter("unique_id").get_parameter_value().string_value
+        )
+        self.device: str = (
+            self.get_parameter("device").get_parameter_value().string_value
         )
         self.baud_rate: int = (
             self.get_parameter("baud_rate").get_parameter_value().integer_value
@@ -54,6 +70,12 @@ class Gps(Node):
         )
         self._frame_id: str = (
             self.get_parameter("frame_id").get_parameter_value().string_value
+        )
+        self.heading_offset_deg: float = (
+            self.get_parameter("heading_offset_deg").get_parameter_value().double_value
+        )
+        self.heading_stddev_deg: float = (
+            self.get_parameter("heading_stddev_deg").get_parameter_value().double_value
         )
 
         # ---- Logging (shared helper) ------------------------------------
@@ -65,10 +87,8 @@ class Gps(Node):
             self.baud_rate,
             self.mode,
             self.use_corrections,
+            self.device,
         )
-
-        # ---- Lock for thread-safe RTCM pool access ----------------------
-        self._rtcm_lock = threading.Lock()
 
         # ---- Mode-specific publishers / subscribers ----------------------
         if self.mode == "Heading_Base":
@@ -78,9 +98,13 @@ class Gps(Node):
             self.base_status_publisher = self.create_publisher(
                 GnssSignalStatus, "base_gps_extended", 50
             )
+            # The base is the antenna directly corrected by NTRIP, so it carries
+            # the best absolute position — publish it as a standard NavSatFix
+            # (with covariance) for navsat_transform / robot_localization.
+            self.base_gps_publisher = self.create_publisher(
+                NavSatFix, "base_gps", 50
+            )
             self.ser.rtcm_message_found += self.handle_rtcm_message
-            self.rtcm_msg_pool: list[CorrectionMessage] = []
-            self.create_timer(1, self.publish_pooled_rtcm)
 
         elif self.mode in ("Rover", "Disabled"):
             self.gps_publisher = self.create_publisher(NavSatFix, "gps", 50)
@@ -94,6 +118,10 @@ class Gps(Node):
                     self.handle_rtcm_correction_from_base,
                     100,
                 )
+                # Moving-baseline heading, converted to an absolute ENU yaw and
+                # published as an Imu (orientation only) for robot_localization
+                # / navsat_transform.
+                self.heading_publisher = self.create_publisher(Imu, "heading", 50)
 
         # ---- Common publishers / timers ----------------------------------
         self.health_publisher = self.create_publisher(
@@ -141,28 +169,26 @@ class Gps(Node):
     # ------------------------------------------------------------------
 
     def handle_rtcm_message(self, rtcm_message) -> None:
-        """Called on the base: pool outgoing RTCM for periodic publish."""
-        msg = CorrectionMessage(
-            header=self._make_header(),
-            message=rtcm_message.serialize(),
+        """Called on the base (serial RX thread): forward each moving-base RTCM
+        message to the rover immediately.
+
+        No batching — correction latency directly degrades the rover's
+        heading solution and slows ambiguity fixing, so we pass each message
+        through the instant it is parsed.  rclpy's publish() is thread-safe,
+        so publishing from the serial receive thread is fine.
+        """
+        self.rtcm_publisher.publish(
+            CorrectionMessage(
+                header=self._make_header(),
+                message=rtcm_message.serialize(),
+            )
         )
-        with self._rtcm_lock:
-            self.rtcm_msg_pool.append(msg)
 
     def handle_rtcm_correction_from_base(self, message: CorrectionMessage) -> None:
         """Called on the rover: forward RTCM from the base topic to the antenna."""
         parsed = RTCMReader.parse(message.message)
         self.ser.send(parsed.serialize())
         self.logger.debug(f"Received RTCM message with identity: {parsed.identity}")
-
-    def publish_pooled_rtcm(self) -> None:
-        """Publish all pooled RTCM messages and clear the pool (thread-safe)."""
-        with self._rtcm_lock:
-            pool_snapshot = list(self.rtcm_msg_pool)
-            self.rtcm_msg_pool.clear()
-        for msg in pool_snapshot:
-            self.rtcm_publisher.publish(msg)
-            self.logger.debug(f"Published RTCM message -> {msg.message}")
 
     # ------------------------------------------------------------------
     # Health & status
@@ -185,23 +211,66 @@ class Gps(Node):
             return
 
         if self.mode in ("Rover", "Disabled"):
-            msg = NavSatFix(
-                header=status.header,
-                latitude=status.latitude,
-                longitude=status.longitude,
-                altitude=status.altitude,
-                position_covariance=status.position_covariance,
-                position_covariance_type=status.position_covariance_type,
-                status=status.status,
-            )
-            self.gps_publisher.publish(msg)
+            self.gps_publisher.publish(self._make_navsatfix(status))
             self.gps_status_publisher.publish(status)
+            # length > 0 means the moving-baseline heading is valid (heading and
+            # length are populated together, only when relPosHeadingValid).
+            if self.mode == "Rover" and status.length > 0.0:
+                self._publish_heading(status)
             self.logger.debug(
                 f"Published GPS data - Lat: {status.latitude:.6f}, "
                 f"Lon: {status.longitude:.6f}"
             )
         else:
+            # Base: directly NTRIP-corrected → best absolute position.
+            self.base_gps_publisher.publish(self._make_navsatfix(status))
             self.base_status_publisher.publish(status)
+
+    def _make_navsatfix(self, status: GnssSignalStatus) -> NavSatFix:
+        """Build a NavSatFix (with covariance) from a GnssSignalStatus."""
+        return NavSatFix(
+            header=status.header,
+            latitude=status.latitude,
+            longitude=status.longitude,
+            altitude=status.altitude,
+            position_covariance=status.position_covariance,
+            position_covariance_type=status.position_covariance_type,
+            status=status.status,
+        )
+
+    def _publish_heading(self, status: GnssSignalStatus) -> None:
+        """Publish the moving-baseline heading as an absolute-yaw Imu.
+
+        Converts the GNSS compass bearing (0 = true North, clockwise) to a ROS
+        ENU yaw (0 = East, counter-clockwise): yaw = 90 - bearing.
+        heading_offset_deg folds in the antenna mount (base->rover vector vs
+        vehicle-forward).  Only yaw is observed, so roll/pitch get huge variance
+        and the angular-velocity / linear-acceleration covariances are flagged
+        absent (leading -1) so robot_localization ignores them.
+
+        Yaw variance comes from the receiver's accHeading (which already scales
+        with Fixed vs Float), floored by heading_stddev_deg so a degraded
+        heading is honestly down-weighted by the EKF.
+        """
+        forward_deg = status.heading + self.heading_offset_deg
+        yaw = math.radians(90.0 - forward_deg)
+        yaw = math.atan2(math.sin(yaw), math.cos(yaw))  # wrap to [-pi, pi]
+        sigma_deg = self.heading_stddev_deg
+        if status.heading_accuracy > 0.0:
+            sigma_deg = max(status.heading_accuracy, self.heading_stddev_deg)
+        var = math.radians(sigma_deg) ** 2
+
+        imu = Imu(header=status.header)
+        imu.orientation.z = math.sin(yaw / 2.0)
+        imu.orientation.w = math.cos(yaw / 2.0)
+        imu.orientation_covariance = [
+            1e6, 0.0, 0.0,
+            0.0, 1e6, 0.0,
+            0.0, 0.0, var,
+        ]
+        imu.angular_velocity_covariance = [-1.0] + [0.0] * 8
+        imu.linear_acceleration_covariance = [-1.0] + [0.0] * 8
+        self.heading_publisher.publish(imu)
 
     def send_nmea_message(self) -> None:
         """Publish the most recent GGA sentence for NTRIP."""

@@ -42,6 +42,7 @@ class NTRIPClient:
     DEFAULT_RECONNECT_ATTEMPT_MAX = 10
     DEFAULT_RECONNECT_ATTEMPT_WAIT_SECONDS = 5
     DEFAULT_RTCM_TIMEOUT_SECONDS = 4
+    DEFAULT_RTCM_READ_BLOCK_SECONDS = 1.0
 
     def __init__(self, host, port, mountpoint, ntrip_version, username, password, logger):
         self._logger = logger
@@ -88,6 +89,16 @@ class NTRIPClient:
         self.reconnect_attempt_max = self.DEFAULT_RECONNECT_ATTEMPT_MAX
         self.reconnect_attempt_wait_seconds = self.DEFAULT_RECONNECT_ATTEMPT_WAIT_SECONDS
         self.rtcm_timeout_seconds = self.DEFAULT_RTCM_TIMEOUT_SECONDS
+        self.rtcm_read_block_seconds = self.DEFAULT_RTCM_READ_BLOCK_SECONDS
+
+    # ------------------------------------------------------------------
+    # Internals — SSL-aware buffered-byte count
+    # ------------------------------------------------------------------
+
+    def _pending(self) -> int:
+        """Bytes already decrypted and buffered inside the SSL layer (0 if plain)."""
+        pend = getattr(self._server_socket, "pending", None)
+        return pend() if pend else 0
 
     # ------------------------------------------------------------------
     # Connection management
@@ -255,19 +266,27 @@ class NTRIPClient:
             self.reconnect()
             self._first_rtcm_received = False
 
-        # Check for available data
-        read_sockets, _, _ = select.select([self._server_socket], [], [], 0)
-        if not read_sockets:
+        # Block (briefly) until the socket is readable, then DRAIN every byte
+        # currently available.  The caster sends each RTCM message as its own
+        # small TLS record (~80-520 B), so a single recv() returns far less than
+        # _CHUNK_SIZE.  The old loop broke as soon as len(chunk) < _CHUNK_SIZE,
+        # i.e. after the FIRST message, and _process_loop then slept 0.5 s — so
+        # a ~1 Hz / ~2 kB/s correction stream was throttled to ~0.3 Hz, the
+        # socket backed up, corrections went stale and were flushed on the 4 s
+        # reconnect, and the receiver never had a fresh enough stream to fix
+        # carrier ambiguities.  Instead we keep reading while the SSL layer has
+        # pending plaintext or the socket has more data immediately ready (each
+        # recv() is guarded so it never blocks).
+        ready, _, _ = select.select(
+            [self._server_socket], [], [], self.rtcm_read_block_seconds
+        )
+        if not ready and self._pending() == 0:
             return None
 
-        # Read all available data
         data = b""
         while True:
             try:
                 chunk = self._server_socket.recv(_CHUNK_SIZE)
-                data += chunk
-                if len(chunk) < _CHUNK_SIZE:
-                    break
             except Exception:
                 if not self._socket_is_open():
                     self._logerr("Socket closed. Reconnecting")
@@ -275,20 +294,31 @@ class NTRIPClient:
                     return None
                 break
 
-        if len(data) == 0:
-            self._read_zero_bytes_count += 1
-            if self._read_zero_bytes_count >= self._read_zero_bytes_max:
-                self._logwarn(
-                    f"Received 0 bytes {self._read_zero_bytes_count} times, reconnecting"
-                )
-                self.reconnect()
-                self._read_zero_bytes_count = 0
-                return None
-        else:
+            if len(chunk) == 0:
+                # Genuine EOF on a readable socket -> peer closed.
+                self._read_zero_bytes_count += 1
+                if self._read_zero_bytes_count >= self._read_zero_bytes_max:
+                    self._logwarn(
+                        f"Received 0 bytes {self._read_zero_bytes_count} times, reconnecting"
+                    )
+                    self.reconnect()
+                    self._read_zero_bytes_count = 0
+                break
+
+            data += chunk
+            # Keep draining: SSL-buffered plaintext first, then socket-ready data.
+            if self._pending() > 0:
+                continue
+            more, _, _ = select.select([self._server_socket], [], [], 0)
+            if not more:
+                break
+
+        if data:
+            self._read_zero_bytes_count = 0
             self._recv_rtcm_last_packet_timestamp = time.time()
             self._first_rtcm_received = True
-
-        return data
+            return data
+        return None
 
     def shutdown(self) -> None:
         """Signal the client to shut down and disconnect."""
@@ -408,16 +438,23 @@ class NtripModule(Node):
     # ------------------------------------------------------------------
 
     def _process_loop(self) -> None:
-        """Background loop: connect then continuously receive RTCM."""
+        """Background loop: connect then continuously receive RTCM.
+
+        No fixed sleep on the receive path — ``recv_rtcm`` blocks on ``select``
+        for up to ``rtcm_read_block_seconds`` when idle and returns immediately
+        with a fully-drained buffer when corrections are flowing, so RTCM is
+        forwarded at line rate instead of one message per 0.5 s.
+        """
         while rclpy.ok():
             if not self._initialized:
                 if self._client.connect():
                     self._initialized = True
                 else:
                     self.logger.error("Unable to connect to NTRIP server")
+                    time.sleep(self._client.reconnect_attempt_wait_seconds)
             else:
                 data = self._client.recv_rtcm()
-                if data is not None:
+                if data:
                     self._correction_pub.publish(
                         CorrectionMessage(
                             header=Header(
@@ -427,7 +464,6 @@ class NtripModule(Node):
                             message=data,
                         )
                     )
-            time.sleep(0.5)
 
     def _subscribe_nmea(self, nmea: Sentence) -> None:
         """Forward the received NMEA sentence to the NTRIP caster."""

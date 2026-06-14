@@ -1,15 +1,20 @@
 # ---------------------------------------------------------------
-# NTRIP client configuration
+# NTRIP client configuration (mower)
 # ---------------------------------------------------------------
-# Set hostname, mountpoint, username, and password to match your
-# NTRIP caster subscription.
+# Non-secret defaults only.  The caster host/mountpoint/credentials are
+# injected at launch from the deployment environment (NTRIP_* vars in
+# /etc/mower/ntrip.env, rendered from the gitignored ansible/secrets.yml) and
+# OVERRIDE the values here — see calian_gnss_ros2.launch_common.ntrip_node.
+#
+# Leave the secret fields blank here; do NOT commit real credentials.
 # ---------------------------------------------------------------
 
 calian_gnss:
   ntrip_client:
     ros__parameters:
-      hostname: "<YOUR_NTRIP_HOST>"
-      port: 2101
-      mountpoint: "<YOUR_MOUNTPOINT>"
-      username: "<YOUR_USERNAME>"
-      password: "<YOUR_PASSWORD>"
+      hostname: ""        # set via NTRIP_HOST
+      port: 2101          # default; override via NTRIP_PORT
+      mountpoint: ""      # set via NTRIP_MOUNTPOINT
+      username: ""        # set via NTRIP_USERNAME
+      password: ""        # set via NTRIP_PASSWORD
+      ntrip_version: "Ntrip/2.0"  # full token (goes verbatim into the header); override via NTRIP_VERSION

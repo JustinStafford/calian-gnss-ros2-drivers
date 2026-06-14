@@ -1,41 +1,47 @@
 # ---------------------------------------------------------------
-# Calian GNSS ROS 2 — antenna configuration
+# Calian GNSS ROS 2 — antenna configuration (mower)
 # ---------------------------------------------------------------
-# Each top-level key under ``calian_gnss`` corresponds to a node
-# name used in a launch file.  Set ``unique_id`` to the value
-# printed by the ``unique_id_finder`` node for each antenna.
+# Each key under ``calian_gnss`` is a node name used by a launch file.
+#
+# Device binding:
+#   Receivers are bound by a STABLE by-id symlink (device:) provisioned by the
+#   ansible serial_aliases udev rule — NOT by the vendor's UBX unique_id scan,
+#   which only matches the Calian-supplied CP210x bridge and never a generic
+#   FTDI (its port description lacks the "Standard" substring the scan filters
+#   on).  The `device` param (added in our fork) makes the driver bind directly.
+#
+#   unique_id is OPTIONAL: when set it is only a non-fatal post-connect sanity
+#   check (warns if the receiver on this port reports a different SEC-UNIQID).
+#
+# Roles:
+#   front antenna (/dev/gnss_front) = moving base = official position, gets NTRIP
+#   rear  antenna (/dev/gnss_rear)  = rover, publishes /gps + heading /gps_extended
 # ---------------------------------------------------------------
 
 calian_gnss:
-  base:
-    ros__parameters:
-      use_corrections: True
-      baud_rate: 230400
-      unique_id: "<YOUR_BASE_UNIQUE_ID>"
-
-calian_gnss:
-  rover:
-    ros__parameters:
-      use_corrections: False
-      baud_rate: 230400
-      unique_id: "<YOUR_ROVER_UNIQUE_ID>"
-
-calian_gnss:
+  # Single-antenna (Disabled) config: disabled.launch.py
   gps_publisher:
     ros__parameters:
-      use_corrections: True
+      device: "/dev/gnss_front"
       baud_rate: 230400
-      unique_id: "<YOUR_ANTENNA_UNIQUE_ID>"
+      use_corrections: False
+      frame_id: "gnss_front"
+      unique_id: ""   # optional; left blank — identity is pinned by the device by-id alias
 
-calian_gnss:
-  gps:
+  # Moving-baseline BASE (front): moving_baseline.launch.py
+  base:
     ros__parameters:
-      use_corrections: True
+      device: "/dev/gnss_front"
       baud_rate: 230400
-      unique_id: "<YOUR_ANTENNA_UNIQUE_ID>"
+      use_corrections: True
+      frame_id: "gnss_front"
+      unique_id: ""   # optional; left blank — identity is pinned by the device by-id alias
 
-calian_gnss:
-  rtcm_handler:
+  # Moving-baseline ROVER (rear): moving_baseline.launch.py
+  rover:
     ros__parameters:
-      key: "Wap5SA.O5VD4g:t2ltWLfva3gp5kituU5M4f9JL83BIwioTV1hGOjrSLU"
-      channel: "<YOUR_ABLY_CHANNEL_NAME>"
+      device: "/dev/gnss_rear"
+      baud_rate: 230400
+      use_corrections: False
+      frame_id: "gnss_rear"
+      unique_id: ""   # optional; left blank — identity is pinned by the device by-id alias

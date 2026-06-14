@@ -214,6 +214,7 @@ class UbloxSerial:
         ],
         rtk_mode: Literal["Disabled", "Heading_Base", "Rover"],
         use_corrections: bool = False,
+        device: str = "",
     ):
         self.logger = SimplifiedLogger(f"{rtk_mode}_Serial")
 
@@ -224,6 +225,7 @@ class UbloxSerial:
 
         self.baudrate = baudrate
         self.unique_id = unique_id
+        self.device = device
         self.port_name: str | None = None
         self.__rtk_mode = rtk_mode
         self.__status = GnssSignalStatus()
@@ -251,10 +253,20 @@ class UbloxSerial:
         """Background loop that keeps the serial connection alive and healthy."""
         while rclpy.ok():
             if not self.port_name:
-                self.logger.info("Finding port...")
-                self.port_name = SerialUtilities.get_port_from_unique_id(
-                    self.unique_id, self.baudrate
-                )
+                if self.device:
+                    # Deterministic binding: use the configured serial device
+                    # path (a stable by-id symlink) and skip the unique_id scan,
+                    # which only probes ports whose description contains
+                    # "Standard" and so never matches a generic FTDI bridge.
+                    self.port_name = self.device
+                    self.logger.info(f"Using configured device: {self.device}")
+                    if self.unique_id:
+                        self.__verify_unique_id()
+                else:
+                    self.logger.info("Finding port...")
+                    self.port_name = SerialUtilities.get_port_from_unique_id(
+                        self.unique_id, self.baudrate
+                    )
             elif self.__port is None or not self.__config_status:
                 self.__setup_serial_port_and_reader(self.port_name, self.baudrate)
             elif not self.__port.is_open:
@@ -280,6 +292,30 @@ class UbloxSerial:
                 else:
                     self.check_antenna_health()
             time.sleep(1)
+
+    def __verify_unique_id(self) -> None:
+        """Non-fatal sanity check when binding by an explicit device path.
+
+        Polls the receiver's SEC-UNIQID and warns only on a definite mismatch
+        (a wrong antenna wired to this port). Silent on timeout so it never
+        blocks bring-up.
+        """
+        check_port = None
+        try:
+            check_port = serial.Serial(self.port_name, self.baudrate)
+            found = SerialUtilities.extract_unique_id_of_port(check_port, 3)
+            if found and found.upper() != self.unique_id.upper():
+                self.logger.warn(
+                    f"Device {self.port_name} unique id {found} does not match "
+                    f"expected {self.unique_id}"
+                )
+            elif found:
+                self.logger.info(f"Verified {self.port_name} unique id {found}")
+        except Exception as e:
+            self.logger.warn(f"Could not verify unique id on {self.port_name} — {e}")
+        finally:
+            if check_port is not None:
+                check_port.close()
 
     # ------------------------------------------------------------------
     # Health
@@ -520,7 +556,9 @@ class UbloxSerial:
                 augmentations_used = bool(rxm_cor and rxm_cor.msgUsed == 2)
             self.__status.augmentations_used = augmentations_used
 
-            # Heading / baseline length
+            # Heading / baseline length.  accHeading (1-sigma, deg) scales with
+            # the solution quality (small when the baseline is Fixed, large at
+            # Float) — it drives the downstream heading covariance.
             if (
                 nav_relposned is not None
                 and nav_relposned.relPosValid == 1
@@ -530,6 +568,15 @@ class UbloxSerial:
                 self.__status.length = round(
                     float(nav_relposned.relPosLength * CM_TO_M), 2
                 )
+                self.__status.heading_accuracy = round(
+                    float(nav_relposned.accHeading), 4
+                )
+            else:
+                # Not valid (no/stale RELPOSNED, or ambiguities not fixed).
+                # Clear so downstream length>0 gating suppresses a stale heading.
+                self.__status.heading = 0.0
+                self.__status.length = 0.0
+                self.__status.heading_accuracy = 0.0
 
             # Accuracy / altitude
             if (
@@ -548,22 +595,49 @@ class UbloxSerial:
                     float(nav_hpposecef.pAcc * MM_TO_M), 4
                 )
 
-            # Position covariance
+            # Position covariance [m^2].  NavSatFix is ENU (East,North,Up)
+            # row-major; NAV-COV reports NED, so swap E<->N and flip the sign of
+            # the Down cross-terms (Down -> Up).  We always populate this when
+            # there is a valid fix — a zero matrix reads as "infinitely
+            # confident" to an EKF, which is dangerous, so we fall back to the
+            # receiver's accuracy estimates if NAV-COV is unavailable.
             if nav_cov is not None and nav_cov.posCovValid == 1:
-                variance = [
-                    round(float(nav_cov.posCovNN), 4),
-                    round(float(nav_cov.posCovNE), 4),
-                    round(float(nav_cov.posCovND), 4),
-                    round(float(nav_cov.posCovNE), 4),
-                    round(float(nav_cov.posCovEE), 4),
-                    round(float(nav_cov.posCovED), 4),
-                    round(float(nav_cov.posCovND), 4),
-                    round(float(nav_cov.posCovED), 4),
-                    round(float(nav_cov.posCovDD), 4),
-                ]
-                self.__status.position_covariance = UserList(variance)
+                ee = round(float(nav_cov.posCovEE), 6)
+                nn = round(float(nav_cov.posCovNN), 6)
+                dd = round(float(nav_cov.posCovDD), 6)
+                en = round(float(nav_cov.posCovNE), 6)
+                eu = round(float(-nav_cov.posCovED), 6)
+                nu = round(float(-nav_cov.posCovND), 6)
+                self.__status.position_covariance = UserList([
+                    ee, en, eu,
+                    en, nn, nu,
+                    eu, nu, dd,
+                ])
                 self.__status.position_covariance_type = (
                     self.__status.COVARIANCE_TYPE_KNOWN
+                )
+            elif self.__status.accuracy_2d > 0.0:
+                # Fallback: diagonal covariance from hAcc/pAcc.
+                var_h = self.__status.accuracy_2d ** 2
+                var_v = max(self.__status.accuracy_3d ** 2 - var_h, var_h)
+                self.__status.position_covariance = UserList([
+                    var_h, 0.0, 0.0,
+                    0.0, var_h, 0.0,
+                    0.0, 0.0, var_v,
+                ])
+                self.__status.position_covariance_type = (
+                    self.__status.COVARIANCE_TYPE_DIAGONAL_KNOWN
+                )
+            else:
+                # No covariance source yet — publish a large, honest uncertainty
+                # rather than a zero (over-confident) matrix.  (10 m)^2.
+                self.__status.position_covariance = UserList([
+                    100.0, 0.0, 0.0,
+                    0.0, 100.0, 0.0,
+                    0.0, 0.0, 100.0,
+                ])
+                self.__status.position_covariance_type = (
+                    self.__status.COVARIANCE_TYPE_APPROXIMATED
                 )
 
             # NavSatStatus

@@ -54,6 +54,37 @@ def gps_node(name: str, mode: str, *, remappings: list | None = None) -> Node:
     )
 
 
+def _ntrip_env_overrides() -> dict:
+    """Pull NTRIP connection settings from the environment, if present.
+
+    Lets credentials live in a deployment-managed env file (e.g.
+    /etc/mower/ntrip.env via systemd EnvironmentFile) instead of the committed
+    ntrip.yaml — so secrets never land in the repo.  Any value set here
+    overrides the matching key in ntrip.yaml (later params win).
+    """
+    env_map = {
+        "hostname": "NTRIP_HOST",
+        "port": "NTRIP_PORT",
+        "mountpoint": "NTRIP_MOUNTPOINT",
+        "username": "NTRIP_USERNAME",
+        "password": "NTRIP_PASSWORD",
+        "ntrip_version": "NTRIP_VERSION",
+        "ssl": "NTRIP_SSL",
+    }
+    overrides = {}
+    for param, env_var in env_map.items():
+        value = os.environ.get(env_var)
+        if not value:
+            continue
+        if param == "port":
+            overrides[param] = int(value)
+        elif param == "ssl":
+            overrides[param] = value.strip().lower() in ("1", "true", "yes", "on")
+        else:
+            overrides[param] = value
+    return overrides
+
+
 def ntrip_node() -> Node:
     """Return the NTRIP client Node action."""
     return Node(
@@ -62,7 +93,9 @@ def ntrip_node() -> Node:
         name="ntrip_client",
         output="screen",
         emulate_tty=True,
-        parameters=[ntrip_config_path(), logs_config_path()],
+        # ntrip.yaml supplies non-secret defaults; env overrides supply the
+        # caster host/mountpoint/credentials from the deployment env file.
+        parameters=[ntrip_config_path(), logs_config_path(), _ntrip_env_overrides()],
         namespace="calian_gnss",
     )
 
