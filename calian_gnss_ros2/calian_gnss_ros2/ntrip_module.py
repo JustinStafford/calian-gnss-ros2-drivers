@@ -41,7 +41,11 @@ class NTRIPClient:
 
     DEFAULT_RECONNECT_ATTEMPT_MAX = 10
     DEFAULT_RECONNECT_ATTEMPT_WAIT_SECONDS = 5
-    DEFAULT_RTCM_TIMEOUT_SECONDS = 4
+    # 10s (was 4s): the 4s watchdog tripped on benign sub-second stream gaps and
+    # drove a reconnect storm. With the correction path now pinned to the stable
+    # HaLow link, a longer window avoids spurious reconnects without meaningfully
+    # delaying detection of a genuinely dead stream.
+    DEFAULT_RTCM_TIMEOUT_SECONDS = 10
     DEFAULT_RTCM_READ_BLOCK_SECONDS = 1.0
 
     def __init__(self, host, port, mountpoint, ntrip_version, username, password, logger):
@@ -116,17 +120,26 @@ class NTRIPClient:
             self._logerr(f"Exception: {e}")
             return False
 
-        # SSL wrapping
+        # SSL wrapping. Must be guarded: a TLS handshake failure here (e.g. on a
+        # mid-stream reconnect) otherwise propagates out of connect() ->
+        # reconnect() -> recv_rtcm() and kills the worker thread, wedging
+        # corrections until a full process restart. Treat it like the other
+        # connect steps and just fail the attempt.
         if self.ssl:
-            ssl_ctx = ssl.create_default_context()
-            if self.cert:
-                ssl_ctx.load_cert_chain(self.cert, self.key)
-            if self.ca_cert:
-                ssl_ctx.load_verify_locations(self.ca_cert)
-            self._raw_socket = self._server_socket
-            self._server_socket = ssl_ctx.wrap_socket(
-                self._raw_socket, server_hostname=self._host
-            )
+            try:
+                ssl_ctx = ssl.create_default_context()
+                if self.cert:
+                    ssl_ctx.load_cert_chain(self.cert, self.key)
+                if self.ca_cert:
+                    ssl_ctx.load_verify_locations(self.ca_cert)
+                self._raw_socket = self._server_socket
+                self._server_socket = ssl_ctx.wrap_socket(
+                    self._raw_socket, server_hostname=self._host
+                )
+            except Exception as e:
+                self._logerr(f"TLS handshake to http://{self._host}:{self._port} failed")
+                self._logerr(f"Exception: {e}")
+                return False
 
         # Send HTTP request
         try:
@@ -446,24 +459,40 @@ class NtripModule(Node):
         forwarded at line rate instead of one message per 0.5 s.
         """
         while rclpy.ok():
-            if not self._initialized:
-                if self._client.connect():
-                    self._initialized = True
+            # Belt-and-suspenders: any unexpected error (TLS, socket, a
+            # ConnectionError raised by reconnect() after max attempts, a publish
+            # on a torn-down handle during shutdown) must NOT kill this worker
+            # thread — otherwise corrections stop silently until a full restart.
+            # Catch, log, drop back to the (re)connect path, back off, continue.
+            try:
+                if not self._initialized:
+                    if self._client.connect():
+                        self._initialized = True
+                    else:
+                        self.logger.error("Unable to connect to NTRIP server")
+                        time.sleep(self._client.reconnect_attempt_wait_seconds)
                 else:
-                    self.logger.error("Unable to connect to NTRIP server")
-                    time.sleep(self._client.reconnect_attempt_wait_seconds)
-            else:
-                data = self._client.recv_rtcm()
-                if data:
-                    self._correction_pub.publish(
-                        CorrectionMessage(
-                            header=Header(
-                                stamp=self.get_clock().now().to_msg(),
-                                frame_id=self._frame_id,
-                            ),
-                            message=data,
+                    data = self._client.recv_rtcm()
+                    if data:
+                        self._correction_pub.publish(
+                            CorrectionMessage(
+                                header=Header(
+                                    stamp=self.get_clock().now().to_msg(),
+                                    frame_id=self._frame_id,
+                                ),
+                                message=data,
+                            )
                         )
-                    )
+            except Exception as e:
+                if not rclpy.ok():
+                    break
+                self.logger.error(f"NTRIP loop error, recovering: {e}")
+                try:
+                    self._client.disconnect()
+                except Exception:
+                    pass
+                self._initialized = False
+                time.sleep(self._client.reconnect_attempt_wait_seconds)
 
     def _subscribe_nmea(self, nmea: Sentence) -> None:
         """Forward the received NMEA sentence to the NTRIP caster."""
