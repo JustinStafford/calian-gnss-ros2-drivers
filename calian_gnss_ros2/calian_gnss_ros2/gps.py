@@ -128,7 +128,11 @@ class Gps(Node):
             ReceiverHealthStatus, "health", 50
         )
         self.create_timer(1, self.get_health_status)
-        self.create_timer(1, self.get_status)
+        # Position/heading are published per GNSS epoch (driven by GGA arrival,
+        # see _on_nmea_epoch) rather than on a fixed timer, so the publish rate
+        # follows the receiver's CFG_RATE_MEAS (5 Hz) with no stale-duplicate
+        # republishing. Health stays on a slow 1 Hz timer.
+        self.ser.nmea_message_found += self._on_nmea_epoch
 
         # ---- Corrections (NTRIP / SPARTN) --------------------------------
         if self.use_corrections:
@@ -201,6 +205,22 @@ class Gps(Node):
             health="Good" if self.ser.get_antenna_health_status else "Bad",
         )
         self.health_publisher.publish(msg)
+
+    def _on_nmea_epoch(self, nmea_message: NMEAMessage) -> None:
+        """Publish a fix on each GNSS epoch, triggered by the GGA sentence.
+
+        GGA is emitted once per measurement epoch, after that epoch's UBX
+        companion messages (NAV-PVT / HPPOSLLH / COV / RELPOSNED) have been
+        cached, and it is what refreshes lat/lon (see ``UbloxSerial``). So GGA
+        arrival marks a complete, coherent fix; driving the publish from here
+        rather than a fixed timer makes the output rate follow CFG_RATE_MEAS
+        (5 Hz) with no stale-duplicate republishing.
+
+        Runs on the serial RX thread; rclpy ``publish()`` is thread-safe (the
+        RTCM forward path already publishes from this thread).
+        """
+        if nmea_message.identity == "GNGGA":
+            self.get_status()
 
     def get_status(self) -> None:
         """Poll the serial module for signal status and publish NavSatFix + extended."""

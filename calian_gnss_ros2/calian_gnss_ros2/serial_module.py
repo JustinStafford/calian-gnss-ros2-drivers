@@ -733,8 +733,22 @@ class UbloxSerial:
             ("CFG_UART1INPROT_UBX", 1),
             ("CFG_UART1OUTPROT_NMEA", 1),
             ("CFG_UART1OUTPROT_UBX", 1),
+            # 5 Hz measurement/solution rate (200 ms), one nav solution per
+            # measurement. NTRIP corrections still arrive at 1 Hz — the receiver
+            # extrapolates between correction epochs, so the rover still outputs
+            # a fixed solution at the full 5 Hz. At 230400 baud the full message
+            # set below is ~45% link utilisation, so no baud change is needed.
+            ("CFG_RATE_MEAS", 200),
+            ("CFG_RATE_NAV", 1),
             ("CFG_MSGOUT_UBX_MON_SYS_UART1", 1),
-            ("CFG_NAVSPG_DYNMODEL", 0),
+            # Automotive dynamic model — a better fit for a wheeled ground
+            # vehicle than the generic "portable" default (0). u-blox's
+            # "robotic lawn mower" model (11) would fit even better, but it is
+            # NOT available on these units' firmware (NEO-F9P, HPGL1L5 1.41):
+            # the receiver ACKs the set but silently keeps the prior value.
+            # Verified on both units 2026-06-23 via tools/check_dynmodel.py;
+            # re-check if the firmware is ever updated.
+            ("CFG_NAVSPG_DYNMODEL", 4),
             ("CFG_MSGOUT_UBX_NAV_SIG_UART1", 1),
             ("CFG_MSGOUT_UBX_NAV_COV_UART1", 1),
             ("CFG_MSGOUT_UBX_NAV_HPPOSECEF_UART1", 1),
