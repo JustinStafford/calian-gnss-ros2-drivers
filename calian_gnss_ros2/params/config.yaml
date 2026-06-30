@@ -13,35 +13,51 @@
 #   unique_id is OPTIONAL: when set it is only a non-fatal post-connect sanity
 #   check (warns if the receiver on this port reports a different SEC-UNIQID).
 #
-# Roles:
-#   front antenna (/dev/gnss_front) = moving base = official position, gets NTRIP
-#   rear  antenna (/dev/gnss_rear)  = rover, publishes /gps + heading /gps_extended
+# Roles (REAR-anchored, 2026-06-30 — see documentation/design notes/
+# gnss-rear-anchor-proposal.md):
+#   rear  antenna (/dev/gnss_rear)  = moving BASE = official robot position;
+#                                     gets AUSCORS NTRIP -> best, honest absolute,
+#                                     published as /calian_gnss/base_gps.
+#   front antenna (/dev/gnss_front) = ROVER -> moving-baseline heading on
+#                                     /calian_gnss/heading (+ its own /gps).
+#   base->rover vector (rear->front) points FORWARD, so heading_offset_deg = 0.
+#
+#   The corrected antenna ALWAYS publishes the `base_gps*` topics regardless of
+#   which physical unit fills the base role, so every downstream consumer binds
+#   to /calian_gnss/base_gps[_extended] and a future role swap touches ONLY this
+#   file (the role-agnostic-topic convention; see the proposal doc, item E1).
 # ---------------------------------------------------------------
 
 calian_gnss:
-  # Single-antenna (Disabled) config: disabled.launch.py
+  # Single-antenna (Disabled) config: disabled.launch.py.  Uses the rear
+  # (official-position) antenna so the single-antenna fallback still reports the
+  # robot's reference point.
   gps_publisher:
-    ros__parameters:
-      device: "/dev/gnss_front"
-      baud_rate: 230400
-      use_corrections: False
-      frame_id: "gnss_front"
-      unique_id: ""   # optional; left blank — identity is pinned by the device by-id alias
-
-  # Moving-baseline BASE (front): moving_baseline.launch.py
-  base:
-    ros__parameters:
-      device: "/dev/gnss_front"
-      baud_rate: 230400
-      use_corrections: True
-      frame_id: "gnss_front"
-      unique_id: ""   # optional; left blank — identity is pinned by the device by-id alias
-
-  # Moving-baseline ROVER (rear): moving_baseline.launch.py
-  rover:
     ros__parameters:
       device: "/dev/gnss_rear"
       baud_rate: 230400
       use_corrections: False
       frame_id: "gnss_rear"
+      unique_id: ""   # optional; left blank — identity is pinned by the device by-id alias
+
+  # Moving-baseline BASE (rear) = corrected, official position: moving_baseline.launch.py
+  base:
+    ros__parameters:
+      device: "/dev/gnss_rear"
+      baud_rate: 230400
+      use_corrections: True
+      frame_id: "gnss_rear"
+      unique_id: ""   # optional; left blank — identity is pinned by the device by-id alias
+
+  # Moving-baseline ROVER (front) = heading source: moving_baseline.launch.py
+  rover:
+    ros__parameters:
+      device: "/dev/gnss_front"
+      baud_rate: 230400
+      use_corrections: False
+      frame_id: "gnss_front"
+      # base(rear)->rover(front) points vehicle-FORWARD, so no mount flip (was
+      # 180 when the front was the base).  VERIFY ON FIRST DRIVE: head north ->
+      # /calian_gnss/heading ENU yaw must be ~+90 deg.
+      heading_offset_deg: 0.0
       unique_id: ""   # optional; left blank — identity is pinned by the device by-id alias

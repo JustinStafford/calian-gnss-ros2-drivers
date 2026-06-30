@@ -14,7 +14,7 @@ from typing import Literal, Callable
 import serial
 from serial.tools.list_ports import comports
 import rclpy
-from pyubx2 import ubxreader, UBXMessage, POLL
+from pyubx2 import ubxreader, UBXMessage, POLL, SET
 from pynmeagps import NMEAMessage
 from pyrtcm import RTCMMessage
 import concurrent.futures
@@ -33,6 +33,9 @@ UBX_STALENESS_SEC = 10
 
 MAX_RETRY_COUNT = 3
 """Maximum retries for antenna config / poll operations."""
+
+RESET_SETTLE_SEC = 2.5
+"""Seconds to wait after a CFG-RST for the receiver to reboot and resume streaming."""
 
 MM_TO_M = 0.001
 """Millimetre-to-metre scaling factor (used for accuracy & altitude)."""
@@ -215,6 +218,7 @@ class UbloxSerial:
         rtk_mode: Literal["Disabled", "Heading_Base", "Rover"],
         use_corrections: bool = False,
         device: str = "",
+        reset_on_start: bool = True,
     ):
         self.logger = SimplifiedLogger(f"{rtk_mode}_Serial")
 
@@ -231,6 +235,7 @@ class UbloxSerial:
         self.__status = GnssSignalStatus()
         self.__quality: int | None = None
         self.__use_corrections = use_corrections
+        self.__reset_on_start = reset_on_start
         self.__config_status = False
         self.__recent_ubx_message: dict[str, tuple[float, UBXMessage]] = {}
         self.__service_constellations = 0
@@ -382,6 +387,15 @@ class UbloxSerial:
                 daemon=True,
             )
             self.__read_thread.start()
+            if self.__reset_on_start and self.__rtk_mode == "Rover":
+                # A hot driver restart (every `ROS: Deploy`) re-binds to a
+                # still-running receiver; the ROVER's moving-baseline RTK engine
+                # does not reliably re-establish from a hot reconfigure, so reset
+                # it to a clean engine first.  config() below re-applies the role
+                # config (a reset reloads NVM config, dropping our RAM config).
+                # Base/Disabled transition fine hot, so we leave them — a reset
+                # there would only re-converge the base's AUSCORS RTK for nothing.
+                self.reset_receiver()
             self.config()
             self.__service_constellations = self.__get_service_constellations()
         except serial.SerialException as se:
@@ -525,6 +539,39 @@ class UbloxSerial:
         self.__config_status = False
         self.logger.error("Configuration failed.")
         return False
+
+    def reset_receiver(self, cold: bool = False) -> None:
+        """Issue a controlled software reset (UBX-CFG-RST) to re-initialise the
+        receiver's GNSS/RTK engine, then wait for it to resume streaming.
+
+        Used at startup — so a hot driver restart (every ``ROS: Deploy``) gives
+        the F9P a clean engine instead of a stale hot-reconfigure — and as the
+        rover moving-baseline self-heal.  CFG-RST is NOT acknowledged, so we send
+        it and wait a fixed settle time.  The USB bridge (FT4232H) stays
+        enumerated — only the F9P behind its UART reboots — so the serial port
+        stays open and the read thread just sees a brief gap (and the __serial
+        _process supervisor restarts it if it ever does drop).  A hot-start mask
+        (default) keeps almanac/ephemeris for fast reacquisition; ``cold`` clears
+        everything.
+
+        A reset reloads config from non-volatile memory, so the caller MUST
+        re-apply ``config()`` afterwards.
+        """
+        if self.__port is None:
+            return
+        nav_bbr = 0xFFFF if cold else 0x0000  # cold vs hot start
+        try:
+            reset = UBXMessage(
+                "CFG", "CFG-RST", SET, navBbrMask=nav_bbr, resetMode=0x01
+            )
+            self.send(reset.serialize())
+            self.logger.info(
+                f"Sent CFG-RST ({'cold' if cold else 'hot'} start); waiting "
+                f"{RESET_SETTLE_SEC:.1f}s for the receiver to re-initialise."
+            )
+            time.sleep(RESET_SETTLE_SEC)
+        except Exception as e:
+            self.logger.error(f"Receiver reset failed: {e}")
 
     # ------------------------------------------------------------------
     # Status

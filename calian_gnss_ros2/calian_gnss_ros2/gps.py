@@ -8,6 +8,7 @@ Operates in three modes:
 
 import math
 import sys
+import time
 from typing import Literal
 
 import rclpy
@@ -25,6 +26,13 @@ from calian_gnss_ros2_msg.msg import (
 )
 from calian_gnss_ros2.logging import setup_node_logging
 from calian_gnss_ros2.serial_module import UbloxSerial
+
+
+# Rover moving-baseline self-heal tuning.
+RTCM_FRESH_SEC = 5.0
+"""Corrections count as 'flowing' if the last one arrived within this window."""
+HEAL_COOLDOWN_SEC = 90.0
+"""Minimum seconds between rover receiver resets (also the initial post-boot grace)."""
 
 
 class Gps(Node):
@@ -55,6 +63,12 @@ class Gps(Node):
         # Float); heading_stddev_deg is the FLOOR — we never claim better.
         self.declare_parameter("heading_offset_deg", 180.0)
         self.declare_parameter("heading_stddev_deg", 1.0)
+        # Reset the receiver on startup so a hot driver restart (every deploy)
+        # re-inits the RTK engine instead of hot-reconfiguring a running one.
+        self.declare_parameter("reset_on_start", True)
+        # Rover self-heal: reset the receiver if RTCM is flowing but no valid
+        # moving-baseline heading appears for this long (0 disables).
+        self.declare_parameter("relpos_heal_timeout_sec", 30.0)
 
         self.unique_id: str = (
             self.get_parameter("unique_id").get_parameter_value().string_value
@@ -77,6 +91,14 @@ class Gps(Node):
         self.heading_stddev_deg: float = (
             self.get_parameter("heading_stddev_deg").get_parameter_value().double_value
         )
+        self.reset_on_start: bool = (
+            self.get_parameter("reset_on_start").get_parameter_value().bool_value
+        )
+        self.relpos_heal_timeout_sec: float = (
+            self.get_parameter("relpos_heal_timeout_sec")
+            .get_parameter_value()
+            .double_value
+        )
 
         # ---- Logging (shared helper) ------------------------------------
         _, self.logger = setup_node_logging(self, f"{self.mode}_GPS")
@@ -88,6 +110,7 @@ class Gps(Node):
             self.mode,
             self.use_corrections,
             self.device,
+            self.reset_on_start,
         )
 
         # ---- Mode-specific publishers / subscribers ----------------------
@@ -122,6 +145,14 @@ class Gps(Node):
                 # published as an Imu (orientation only) for robot_localization
                 # / navsat_transform.
                 self.heading_publisher = self.create_publisher(Imu, "heading", 50)
+                # Self-heal: if base RTCM keeps arriving but the rover yields no
+                # valid heading for relpos_heal_timeout_sec, its RTK engine is
+                # likely wedged (typical after a hot driver restart) -> reset it.
+                self._last_rtcm_time = 0.0
+                self._last_valid_heading_time = time.monotonic()
+                self._last_heal_time = time.monotonic()  # initial grace = 1 cooldown
+                if self.relpos_heal_timeout_sec > 0.0:
+                    self.create_timer(5.0, self._relpos_self_heal)
 
         # ---- Common publishers / timers ----------------------------------
         self.health_publisher = self.create_publisher(
@@ -192,6 +223,7 @@ class Gps(Node):
         """Called on the rover: forward RTCM from the base topic to the antenna."""
         parsed = RTCMReader.parse(message.message)
         self.ser.send(parsed.serialize())
+        self._last_rtcm_time = time.monotonic()
         self.logger.debug(f"Received RTCM message with identity: {parsed.identity}")
 
     # ------------------------------------------------------------------
@@ -236,6 +268,7 @@ class Gps(Node):
             # length > 0 means the moving-baseline heading is valid (heading and
             # length are populated together, only when relPosHeadingValid).
             if self.mode == "Rover" and status.length > 0.0:
+                self._last_valid_heading_time = time.monotonic()
                 self._publish_heading(status)
             self.logger.debug(
                 f"Published GPS data - Lat: {status.latitude:.6f}, "
@@ -291,6 +324,33 @@ class Gps(Node):
         imu.angular_velocity_covariance = [-1.0] + [0.0] * 8
         imu.linear_acceleration_covariance = [-1.0] + [0.0] * 8
         self.heading_publisher.publish(imu)
+
+    def _relpos_self_heal(self) -> None:
+        """Rover watchdog (timer): reset the receiver when base RTCM is flowing
+        but the moving-baseline solution has been invalid too long — a wedged
+        RTK engine, common after a hot driver restart.  Cooldown-guarded so it
+        never reset-loops; the initial grace is one cooldown, giving the receiver
+        time to fix on boot before the first heal.
+        """
+        now = time.monotonic()
+        rtcm_flowing = (now - self._last_rtcm_time) < RTCM_FRESH_SEC
+        heading_stale = (
+            now - self._last_valid_heading_time > self.relpos_heal_timeout_sec
+        )
+        cooling_down = (now - self._last_heal_time) < HEAL_COOLDOWN_SEC
+        if not (rtcm_flowing and heading_stale and not cooling_down):
+            return
+        self.logger.warn(
+            f"No valid moving-baseline heading for "
+            f"{self.relpos_heal_timeout_sec:.0f}s while base RTCM is flowing — "
+            "resetting the receiver to re-initialise its RTK engine."
+        )
+        self._last_heal_time = now
+        self.ser.reset_receiver()
+        self.ser.config()
+        # Restart the heading clock so the cooldown (not the stale timer) paces
+        # the next attempt while the receiver reacquires.
+        self._last_valid_heading_time = time.monotonic()
 
     def send_nmea_message(self) -> None:
         """Publish the most recent GGA sentence for NTRIP."""

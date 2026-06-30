@@ -246,12 +246,16 @@ ros2 launch calian_gnss_ros2 moving_baseline.launch.py
 **Published topics:**
 
 ```
-/calian_gnss/base/gps_extended         # calian_gnss_ros2_msg/GnssSignalStatus
-/calian_gnss/base/antenna_health       # calian_gnss_ros2_msg/ReceiverHealthStatus
-/calian_gnss/base/rtcm_corrections     # calian_gnss_ros2_msg/CorrectionMessage (remapped → rtcm_topic)
-/calian_gnss/rover/gps                 # sensor_msgs/NavSatFix
-/calian_gnss/rover/gps_extended        # calian_gnss_ros2_msg/GnssSignalStatus
-/calian_gnss/rover/antenna_health      # calian_gnss_ros2_msg/ReceiverHealthStatus
+# NOTE (mower fork): topics are FLATTENED to the /calian_gnss namespace (no
+# per-node /base//rover/ segment), and the base also publishes a NavSatFix.
+# On the mower: base = REAR (corrected, official position); rover = FRONT (heading).
+/calian_gnss/base_gps            # sensor_msgs/NavSatFix      (base = corrected, official position)
+/calian_gnss/base_gps_extended   # calian_gnss_ros2_msg/GnssSignalStatus (base quality/accuracy_2d)
+/calian_gnss/rtcm_corrections    # calian_gnss_ros2_msg/CorrectionMessage (base→rover, remapped → rtcm_topic)
+/calian_gnss/gps                 # sensor_msgs/NavSatFix      (rover absolute — noisier, diagnostic)
+/calian_gnss/gps_extended        # calian_gnss_ros2_msg/GnssSignalStatus (rover quality + heading/length)
+/calian_gnss/heading             # sensor_msgs/Imu            (rover: absolute moving-baseline ENU yaw)
+/calian_gnss/health              # calian_gnss_ros2_msg/ReceiverHealthStatus
 ```
 
 ---
