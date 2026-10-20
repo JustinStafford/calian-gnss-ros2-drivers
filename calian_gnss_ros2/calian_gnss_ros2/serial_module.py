@@ -625,6 +625,19 @@ class UbloxSerial:
                 self.__status.length = 0.0
                 self.__status.heading_accuracy = 0.0
 
+            # Full-precision position.  The NMEA lat/lon cached above is rounded
+            # to 1e-6 deg (~11 x 9 cm grid here), which throws away the RTK
+            # solution (hAcc ~1.4 cm) and makes the EKF chase grid steps.
+            # NAV-HPPOSLLH carries lat/lon at 1e-7 + 1e-9 deg for the same
+            # epoch — GGA, which drives the publish, is emitted after the
+            # epoch's UBX messages.  pyubx2 (>= 1.2.x, _set_attribute_navhp)
+            # already folds latHp/lonHp into .lat/.lon in degrees and exposes
+            # NO separate latHp/lonHp attributes — reading them raised every
+            # epoch and aborted the whole status build (2026-10-15 regression).
+            if nav_hpposllh is not None and nav_hpposllh.invalidLlh == 0:
+                self.__status.latitude = float(nav_hpposllh.lat)
+                self.__status.longitude = float(nav_hpposllh.lon)
+
             # Accuracy / altitude
             if (
                 nav_hpposecef is not None
